@@ -1,7 +1,7 @@
 """Support for restoring entity states on startup."""
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime
 from typing import Any, Dict, List, Set, Optional  # noqa  pylint_disable=unused-import
 
 from homeassistant.core import HomeAssistant, callback, State, CoreState
@@ -19,13 +19,51 @@ DATA_RESTORE_STATE_TASK = 'restore_state_task'
 _LOGGER = logging.getLogger(__name__)
 
 STORAGE_KEY = 'core.restore_state'
-STORAGE_VERSION = 1
+STORAGE_VERSION = 2
 
 # How long between periodically saving the current states to disk
 STATE_DUMP_INTERVAL = timedelta(minutes=15)
 
 # How long should a saved state be preserved if the entity no longer exists
 STATE_EXPIRATION = timedelta(days=7)
+
+
+class StoredState:
+    """Object to represent a stored state."""
+
+    def __init__(self, state: State, last_seen: datetime) -> None:
+        """Initialize a new stored state."""
+        self.state = state
+        self.last_seen = last_seen
+
+    def as_dict(self) -> Dict:
+        """Return a dict representation of the stored state."""
+        return {
+            'state': self.state.as_dict(),
+            'last_seen': self.last_seen,
+        }
+
+    @classmethod
+    def from_dict(cls, json_dict: Dict) -> 'StoredState':
+        """Initialize a stored state from a dict."""
+        last_seen = json_dict['last_seen']
+
+        if isinstance(last_seen, str):
+            last_seen = dt_util.parse_datetime(last_seen)
+
+        return cls(State.from_dict(json_dict['state']), last_seen)
+
+
+class RestoreStateStore(Store):
+    """Helper class for managing the data store."""
+
+    async def _async_migrate_func(self, old_version, old_data):
+        """Migrate to the new version."""
+        if old_version == 1:
+            # Version 1 stored a list of states, and didn't include last_seen
+            now = dt_util.utcnow()
+            return [StoredState(State.from_dict(state), now).as_dict()
+                    for state in old_data]
 
 
 class RestoreStateData():
@@ -43,18 +81,18 @@ class RestoreStateData():
                 data = cls(hass)
 
                 try:
-                    states = await data.store.async_load()
+                    stored_states = await data.store.async_load()
                 except HomeAssistantError as exc:
                     _LOGGER.error("Error loading last states", exc_info=exc)
-                    states = None
+                    stored_states = None
 
-                if states is None:
+                if stored_states is None:
                     _LOGGER.debug('Not creating cache - no saved states found')
                     data.last_states = {}
                 else:
                     data.last_states = {
-                        state['entity_id']: State.from_dict(state)
-                        for state in states}
+                        item['state']['entity_id']: StoredState.from_dict(item)
+                        for item in stored_states}
                     _LOGGER.debug(
                         'Created cache with %s', list(data.last_states))
 
@@ -74,46 +112,49 @@ class RestoreStateData():
     def __init__(self, hass: HomeAssistant) -> None:
         """Initialize the restore state data class."""
         self.hass = hass  # type: HomeAssistant
-        self.store = Store(hass, STORAGE_VERSION, STORAGE_KEY,
-                           encoder=JSONEncoder)  # type: Store
-        self.last_states = {}  # type: Dict[str, State]
+        self.store = RestoreStateStore(
+            hass, STORAGE_VERSION, STORAGE_KEY,
+            encoder=JSONEncoder)  # type: RestoreStateStore
+        self.last_states = {}  # type: Dict[str, StoredState]
         self.entity_ids = set()  # type: Set[str]
 
-    def async_get_states(self) -> List[State]:
+    def async_get_stored_states(self) -> List[StoredState]:
         """Get the set of states which should be stored.
 
         This includes the states of all registered entities, as well as the
         stored states from the previous run, which have not been created as
         entities on this run, and have not expired.
         """
+        now = dt_util.utcnow()
         all_states = self.hass.states.async_all()
         current_entity_ids = set(state.entity_id for state in all_states)
 
         # Start with the currently registered states
-        states = [state for state in all_states
-                  if state.entity_id in self.entity_ids]
+        stored_states = [StoredState(state, now) for state in all_states
+                         if state.entity_id in self.entity_ids]
 
-        expiration_time = dt_util.utcnow() - STATE_EXPIRATION
+        expiration_time = now - STATE_EXPIRATION
 
-        for entity_id, state in self.last_states.items():
+        for entity_id, stored_state in self.last_states.items():
             # Don't save old states that have entities in the current run
             if entity_id in current_entity_ids:
                 continue
 
             # Don't save old states that have expired
-            if state.last_updated < expiration_time:
+            if stored_state.last_seen < expiration_time:
                 continue
 
-            states.append(state)
+            stored_states.append(stored_state)
 
-        return states
+        return stored_states
 
     async def async_dump_states(self) -> None:
         """Save the current state machine to storage."""
         _LOGGER.debug("Dumping states")
         try:
             await self.store.async_save([
-                state.as_dict() for state in self.async_get_states()])
+                stored_state.as_dict()
+                for stored_state in self.async_get_stored_states()])
         except HomeAssistantError as exc:
             _LOGGER.error("Error saving current states", exc_info=exc)
 
@@ -172,4 +213,6 @@ class RestoreEntity(Entity):
             _LOGGER.warning("Cannot get last state. Entity not added to hass")
             return None
         data = await RestoreStateData.async_get_instance(self.hass)
-        return data.last_states.get(self.entity_id)
+        if self.entity_id not in data.last_states:
+            return None
+        return data.last_states[self.entity_id].state
